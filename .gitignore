@@ -5,18 +5,27 @@
 # never be.
 
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
-config/api_keys.json          # your Gemini API key, plus per-plugin credentials
-config/certs/                 # the dashboard's TLS private key and certificate
-config/whatsapp_web/          # a LINKED WhatsApp session — committing it hands
-                              # somebody your WhatsApp account, not just a key
-**/token*.json                # Google OAuth tokens (Gmail / Calendar plugins)
-**/client_secret*.json        # Google OAuth client secrets
+# your Gemini API key, plus per-plugin credentials
+config/api_keys.json
+# the dashboard's TLS private key and certificate
+config/certs/
+# a LINKED WhatsApp session — committing it hands
+config/whatsapp_web/
+# somebody your WhatsApp account, not just a key
+# Google OAuth tokens (Gmail / Calendar plugins)
+**/token*.json
+# Google OAuth client secrets
+**/client_secret*.json
 *credentials*.json
 .env
 .env.*
 
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
+memory/conversations.jsonl
+# voice-lock biometrics
+memory/voiceprint*.npy
+config/voice_lock.json
 memory/*.db
 
 # ── Python build noise ────────────────────────────────────────────────────────

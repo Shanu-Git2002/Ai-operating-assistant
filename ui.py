@@ -1001,6 +1001,103 @@ class MetricBar(QWidget):
 
         p.end()
 
+class AgentPanel(QWidget):
+    """Left-column panel: live status of the specialist agents + a short
+    activity timeline. Fed with AgentHub.snapshot() dicts via update_snapshot()
+    (always on the Qt thread — MainWindow routes it through a signal)."""
+
+    _ORDER = (("dev", "💻", "DEV"), ("research", "🔎", "RESEARCH"),
+              ("system", "🖥", "SYSTEM"), ("task", "⚙", "TASK"))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+
+        hdr = QLabel("◈ AGENTS")
+        hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
+                          f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
+        lay.addWidget(hdr)
+
+        self._rows: dict[str, tuple[QLabel, QLabel]] = {}
+        for key, icon, name in self._ORDER:
+            box = QWidget()
+            box.setStyleSheet(f"background: {C.PANEL2}; border: 1px solid {C.BORDER_A}; "
+                              f"border-radius: 3px;")
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(5, 2, 5, 2)
+            bl.setSpacing(0)
+            title = QLabel(f"{icon} {name}  ○")
+            title.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+            act = QLabel("idle")
+            act.setFont(QFont("Courier New", 6))
+            act.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+            bl.addWidget(title)
+            bl.addWidget(act)
+            lay.addWidget(box)
+            self._rows[key] = (title, act)
+
+        tl_hdr = QLabel("◈ TIMELINE")
+        tl_hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        tl_hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
+                             f"border-bottom: 1px solid {C.BORDER}; padding: 4px 0 4px 0;")
+        lay.addWidget(tl_hdr)
+
+        self._timeline = QLabel("—")
+        self._timeline.setFont(QFont("Courier New", 6))
+        self._timeline.setWordWrap(True)
+        self._timeline.setTextFormat(Qt.TextFormat.RichText)
+        self._timeline.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._timeline.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+        lay.addWidget(self._timeline)
+
+    @staticmethod
+    def _elide(text: str, n: int = 20) -> str:
+        text = " ".join(str(text).split())
+        return text if len(text) <= n else text[: n - 1] + "…"
+
+    def update_snapshot(self, snap: dict) -> None:
+        agents = {a["key"]: a for a in (snap or {}).get("agents", [])}
+        for key, icon, name in self._ORDER:
+            a = agents.get(key, {})
+            title, act = self._rows[key]
+            busy = bool(a.get("busy"))
+            col = C.GREEN if busy else C.TEXT_DIM
+            title.setText(f"{icon} {name}  {'●' if busy else '○'}")
+            title.setStyleSheet(f"color: {col}; background: transparent; border: none;")
+            act.setText(self._elide(a.get("activity") or "idle"))
+            act.setStyleSheet(f"color: {C.TEXT_MED if busy else C.TEXT_DIM}; "
+                              f"background: transparent; border: none;")
+
+        icons = {k: i for k, i, _ in self._ORDER}
+        lines = []
+        for ev in reversed((snap or {}).get("timeline", [])):
+            kind = ev.get("type")
+            if kind == "tool_end":
+                continue
+            ic = icons.get(ev.get("agent"), "◆")
+            ts = time.strftime("%H:%M", time.localtime(ev.get("ts", time.time())))
+            if kind == "tool_start":
+                txt = ev.get("tool", "")
+            elif kind == "job_start":
+                txt = f"#{ev.get('job')} start"
+            elif kind == "job_step":
+                txt = f"#{ev.get('job')} {ev.get('tool', '')}"
+            elif kind == "job_end":
+                txt = f"#{ev.get('job')} {ev.get('status', '')}"
+            else:
+                continue
+            esc = self._elide(txt, 16).replace("&", "&amp;").replace("<", "&lt;")
+            lines.append(f"<span style='color:{C.TEXT_DIM}'>{ts}</span> {ic} {esc}")
+            if len(lines) >= 7:
+                break
+        self._timeline.setText("<br>".join(lines) if lines else "—")
+
+
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
 
@@ -2954,6 +3051,7 @@ class MainWindow(QMainWindow):
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+    _agents_sig     = pyqtSignal(object)       # AgentHub.snapshot() → agent panel
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
@@ -3230,6 +3328,7 @@ class MainWindow(QMainWindow):
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+        self._agents_sig.connect(self._agent_panel.update_snapshot)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
@@ -4070,6 +4169,9 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(info_panel)
         lay.addSpacing(4)
+
+        self._agent_panel = AgentPanel()
+        lay.addWidget(self._agent_panel)
 
         lay.addStretch()
 
@@ -5756,6 +5858,10 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def update_agents(self, snapshot: dict) -> None:
+        """Thread-safe: refresh the agent status panel and timeline."""
+        self._win._agents_sig.emit(snapshot)
 
     def wait_for_api_key(self):
         while not self._win._ready:

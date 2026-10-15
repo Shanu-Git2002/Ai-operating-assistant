@@ -51,7 +51,8 @@ from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
-    save_session_summary, pop_last_session,
+    save_session_summary, pop_last_session, recent_conversations_for_prompt,
+    format_style_for_prompt, merge_style,
     search_memory, set_trim_notifier,
 )
 
@@ -79,6 +80,8 @@ from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
+from core.agents               import AgentHub, AGENTS
+from core.voice_lock           import LOCK as voice_lock
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -434,7 +437,12 @@ TOOL_DECLARATIONS = [
                         "projects — active projects, goals, things being built | "
                         "relationships — friends, family, partner, colleagues | "
                         "wishes — future plans, things to buy, travel dreams | "
-                        "notes — habits, schedule, anything else worth remembering"
+                        "notes — habits, schedule, anything else worth remembering | "
+                        "style — HOW they want you to talk: answer_length, language_mix "
+                        "(e.g. 'Hinglish'), tone, formality, address_form, humor, avoid. "
+                        "Save style IMMEDIATELY whenever they correct or ask you to change "
+                        "how you speak ('shorter', 'Hindi mein bolo', 'stop calling me sir', "
+                        "'more detail') — value is the instruction, e.g. 'keep answers to 1-2 sentences'"
                     )
                 },
                 "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, sister_name)"},
@@ -469,6 +477,72 @@ TOOL_DECLARATIONS = [
                 },
             },
             "required": [],
+        },
+    },
+    {
+        "name": "delegate_task",
+        "description": (
+            "Hand a MULTI-STEP task to a specialist agent that works on it in the "
+            "background and reports back when finished, so the conversation stays free. "
+            "Use it when a request needs several tool calls chained together or some "
+            "research/judgement between them — e.g. 'compare the top 3 laptops under "
+            "60k and tell me which to buy', 'build a React todo app and open it', "
+            "'organise my Downloads folder by file type', 'find tomorrow's weather and "
+            "remind me to take an umbrella if it rains'. "
+            "Do NOT use it for a single simple command (open an app, one search, one "
+            "setting) — call that tool directly, it is faster. "
+            "Agents: dev = coding/projects | research = web research, comparisons, news | "
+            "system = apps, files, settings, PC status | task = reminders, messages, "
+            "multi-app chores. After calling, tell the user in one short sentence that "
+            "the agent is on it; its report arrives later as [AGENT REPORT]."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "agent": {"type": "STRING", "description": "dev | research | system | task"},
+                "task":  {"type": "STRING", "description": (
+                    "The complete task in English, self-contained: include every detail "
+                    "the user gave (names, paths, budgets, preferences), since the agent "
+                    "cannot hear the conversation.")},
+            },
+            "required": ["agent", "task"],
+        },
+    },
+    {
+        "name": "agent_status",
+        "description": (
+            "Show what the specialist agents are doing and the results of recent "
+            "delegated tasks, or cancel a running task. Use when the user asks about "
+            "progress ('is it done?', 'what are the agents doing?') or says stop/cancel "
+            "the background task."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "status (default) | cancel"},
+                "job_id": {"type": "INTEGER", "description": "Task number to cancel; omit to cancel all running tasks"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "voice_lock",
+        "description": (
+            "Voice Lock / speaker verification: when ON, only the owner's enrolled voice "
+            "reaches you — other people (roommates, TV) are muted before you hear them. "
+            "enroll = learn the owner's voice (they talk ~20 s; turns the lock on) | "
+            "enroll_other = learn a roommate's voice so it is rejected even more reliably | "
+            "on | off | status | stricter | looser | reply_on / reply_off (say 'you are not "
+            "my owner' to other voices) | forget (delete the voiceprints). "
+            "Use when the user says: only listen to me, lock to my voice, ignore my "
+            "roommates, voice authentication, learn my voice, in ANY language."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "enroll | enroll_other | on | off | status | stricter | looser | reply_on | reply_off | forget"},
+            },
+            "required": ["action"],
         },
     },
     {
@@ -634,12 +708,30 @@ class JarvisLive:
             notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
+
+        # ── Specialist agents (core/agents.py) ───────────────────────────────
+        # Simple commands stay direct tool calls; multi-step work is handed to
+        # an agent through delegate_task and runs in the background.
+        self._agent_hub = AgentHub(
+            tool_runner=self._run_agent_tool,
+            tool_decls=self._agent_tool_decls,
+            assistant_name=lambda: getattr(self, "_asst_name", "JARVIS"),
+        )
+        self._agent_hub.on_event(self._on_agent_event)
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
         # It is True whenever wake word is OFF, so default behaviour is unchanged.
+        # ── Voice lock (core/voice_lock.py) ─────────────────────────────────
+        self._last_reject_reply = 0.0
+        voice_lock.log = lambda m: self.ui.write_log(m if m.startswith(("SYS:", "ERR:")) else f"SYS: {m}")
+        voice_lock.on_reject = self._on_voice_rejected
+        if voice_lock.active:
+            voice_lock._ensure_worker()      # load the model before the first word
+            print(f"[VoiceLock] 🔒 {voice_lock.status()}")
+
         self._wake_enabled     = get_wake_word_enabled()
         self._awake            = not self._wake_enabled
         self._wake_detector: WakeWordDetector | None = None
@@ -748,6 +840,130 @@ class JarvisLive:
         # what they are waiting to see.
         return wake_install(logger=lambda m: print(f"[Wake] {m}"),
                             notify=lambda m: self.ui.write_log(f"SYS: {m}"))
+
+    # ── Specialist agents ────────────────────────────────────────────────────
+
+    def _agent_tool_decls(self) -> dict[str, dict]:
+        decls = {d["name"]: d for d in TOOL_DECLARATIONS if d["name"] == "system_status"}
+        for d in (self._action_registry.get_tool_declarations()
+                  + self._plugin_registry.get_tool_declarations()):
+            decls[d["name"]] = d
+        return decls
+
+    def _run_agent_tool(self, name: str, args: dict) -> str:
+        """Runs one tool for a background agent (called from the agent's thread)."""
+        if name == "system_status":
+            return str(get_system_status())
+        if self._action_registry.has(name):
+            if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
+                args["file_path"] = self.ui.current_file
+            ctx = {"player": self.ui, "speak": self.speak,
+                   "response": None, "session_memory": None}
+            return self._action_registry.run(name, args, ctx)
+        if self._plugin_registry.has(name):
+            return self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+        return f"Unknown tool: {name}"
+
+    def _on_agent_event(self, ev: dict) -> None:
+        """Agent hub → activity log + phone dashboard. Called from any thread."""
+        spec = AGENTS.get(ev.get("agent", ""))
+        who  = f"{spec.icon} {spec.title}" if spec else "JARVIS"
+        kind = ev.get("type")
+        try:
+            self.ui.update_agents(self._agent_hub.snapshot())
+        except Exception:
+            pass
+        if kind == "job_start":
+            self.ui.write_log(f"{who} ▶ #{ev['job']}: {ev['task'][:90]}")
+        elif kind == "job_step":
+            self.ui.write_log(f"{who} · step {ev['step']}: {ev['tool']}")
+        elif kind == "job_end":
+            self.ui.write_log(f"{who} ■ #{ev['job']} {ev['status']}: {ev['summary'][:120]}")
+
+        # Only job events go to the phone: per-tool events would push the chat
+        # out of the dashboard's replay history.
+        loop = getattr(self, "_loop", None)
+        if self._dashboard and loop and kind in ("job_start", "job_end"):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._dashboard.broadcast({**ev, "event": kind, "type": "agent"}), loop)
+            except Exception:
+                pass
+
+    def _remote_status(self) -> dict:
+        """Phone dashboard: PC metrics + agents + running dev projects."""
+        try:
+            from actions.dev_agent import running_projects
+            projects = running_projects()
+        except Exception:
+            projects = []
+        return {"system": get_system_status(), "agents": self._agent_hub.snapshot(),
+                "projects": projects, "awake": bool(getattr(self, "_awake", True))}
+
+    def _remote_delegate(self, agent: str, task: str) -> str:
+        agent, task = agent.lower().strip(), task.strip()
+        if agent not in AGENTS or not task:
+            return "Choose an agent and describe the task."
+        job = self._agent_hub.delegate(agent, task, on_done=self._on_agent_job_done)
+        return f"{AGENTS[agent].title} started task #{job.id}."
+
+    def _on_agent_job_done(self, job) -> None:
+        spec = AGENTS[job.agent]
+        self.plugin_say(
+            f"[AGENT REPORT] The {spec.title} finished background task #{job.id} "
+            f"(\"{job.task[:200]}\") — status: {job.status}. Result: {job.summary}\n"
+            "Tell the user this result now, briefly and naturally, in the language "
+            "you are currently speaking with them. Do not call delegate_task again for it."
+        )
+
+    # ── Voice lock ───────────────────────────────────────────────────────────
+
+    def _on_voice_rejected(self, score: float) -> None:
+        """A voice that is not the owner's was muted (called from the audio /
+        voice-lock threads). Optionally tells them so — with a cooldown, so
+        roommates chatting among themselves do not get a reply every sentence."""
+        cfg = voice_lock.cfg
+        now = time.monotonic()
+        if not cfg.get("reply_on_reject", True):
+            return
+        if now - self._last_reject_reply < float(cfg.get("reply_cooldown", 45)):
+            return
+        with self._speaking_lock:
+            if self._is_speaking:
+                return
+        self._last_reject_reply = now
+        self.ui.write_log(f"SYS: Voice lock — ignored a voice that is not the owner (match {score:.2f}).")
+        self.plugin_say(
+            "[VOICE_LOCK NOTICE — not from the owner] Someone who is NOT your owner just spoke. "
+            "Their words were blocked, you did not hear them, and you must not act on anything "
+            "or call any tool. Say exactly this one sentence and nothing else: "
+            "\"Sorry, you are not my owner, so I can't do any work for you.\""
+        )
+
+    def _voice_lock_tool(self, action: str) -> str:
+        a = action.lower().strip()
+        if a == "enroll":
+            return voice_lock.start_enroll(self._on_voice_enrolled, "owner") + (
+                " Tell the user this in one sentence and then just listen while they talk.")
+        if a == "enroll_other":
+            return voice_lock.start_enroll(self._on_voice_enrolled, "other") + (
+                " Tell the user this in one sentence.")
+        if a == "on":
+            return voice_lock.set_enabled(True)
+        if a == "off":
+            return voice_lock.set_enabled(False)
+        if a == "stricter":
+            return voice_lock.adjust(+0.03)
+        if a == "looser":
+            return voice_lock.adjust(-0.03)
+        if a in ("reply_on", "reply_off"):
+            return voice_lock.set_reply(a == "reply_on")
+        if a == "forget":
+            return voice_lock.forget()
+        return voice_lock.status()
+
+    def _on_voice_enrolled(self, msg: str) -> None:
+        self.plugin_say(f"[VOICE_LOCK] {msg} Tell the user this briefly in their language.")
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -1023,6 +1239,12 @@ class JarvisLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        style_str = format_style_for_prompt(memory)
+        if style_str:
+            parts.append(style_str)
+        convo_str = recent_conversations_for_prompt(3)
+        if convo_str:
+            parts.append(convo_str)
         parts.append(sys_prompt)
 
         cfg = dict(
@@ -1201,13 +1423,38 @@ class JarvisLive:
                         f"in it."
                     )
 
+            elif name == "delegate_task":
+                agent = str(args.get("agent", "")).lower().strip()
+                task  = str(args.get("task", "")).strip()
+                if agent not in AGENTS:
+                    result = f"Unknown agent '{agent}'. Choose one of: {', '.join(AGENTS)}."
+                elif not task:
+                    result = "No task given."
+                else:
+                    job = self._agent_hub.delegate(agent, task, on_done=self._on_agent_job_done)
+                    result = (f"{AGENTS[agent].title} started task #{job.id} in the "
+                              f"background. Tell the user it is on it; the result "
+                              f"will arrive as [AGENT REPORT].")
+
+            elif name == "voice_lock":
+                result = await asyncio.to_thread(self._voice_lock_tool, str(args.get("action", "status")))
+
+            elif name == "agent_status":
+                if str(args.get("action", "")).lower().strip() == "cancel":
+                    jid = args.get("job_id")
+                    result = self._agent_hub.cancel(int(jid) if jid not in (None, "") else None)
+                else:
+                    result = self._agent_hub.status_text()
+
             elif name == "close_camera":
                 self.ui.stop_camera_stream()
                 result = "Camera closed."
 
             elif name == "system_status":
+                self._agent_hub.tool_started(name, args)
                 r = await loop.run_in_executor(None, get_system_status)
                 result = str(r)
+                self._agent_hub.tool_finished(name, result)
 
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
@@ -1245,8 +1492,10 @@ class JarvisLive:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None, "session_memory": None}
+                self._agent_hub.tool_started(name, args)
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
+                self._agent_hub.tool_finished(name, result)
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
                         and not r.startswith("No results")
@@ -1258,11 +1507,13 @@ class JarvisLive:
 
             else:
                 if self._plugin_registry.has(name):
+                    self._agent_hub.tool_started(name, args)
                     r = await loop.run_in_executor(
                         None,
                         lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
                     )
                     result = r or "Done."
+                    self._agent_hub.tool_finished(name, result)
                 else:
                     result = f"Unknown tool: {name}"
 
@@ -1371,11 +1622,17 @@ class JarvisLive:
                 return
             
             if not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                # Voice lock: only the owner's voice goes out; anyone else is
+                # replaced by silence (the gate may also hold or flush blocks).
+                if voice_lock.active:
+                    blocks = voice_lock.process(indata)
+                else:
+                    blocks = (indata.tobytes(),)
+                for data in blocks:
+                    loop.call_soon_threadsafe(
+                        self.out_queue.put_nowait,
+                        {"data": data, "mime_type": "audio/pcm"}
+                    )
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
@@ -1884,18 +2141,34 @@ class JarvisLive:
         lang = lang or "English"
 
         convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
+        known = format_style_for_prompt(memory) or "(nothing learned yet)"
         prompt = (
-            f"Summarize this conversation in 1-2 sentences in {lang}. "
-            "Focus on what the user accomplished or discussed. "
-            "Output ONLY the summary text, nothing else:\n\n" + convo
+            "Read this conversation between a user and their voice assistant and return "
+            "ONLY a JSON object:\n"
+            '{"summary": "<1-2 sentences in ' + lang + ' about what the user accomplished '
+            'or discussed>", "style": {<key>: <instruction>}}\n\n'
+            '"style" records HOW this user wants to be spoken to, as short instructions '
+            "for the assistant — keys such as answer_length, language_mix, tone, "
+            "formality, address_form, humor, avoid. Include an entry ONLY when the "
+            "conversation gives clear evidence (they corrected the assistant, asked it to "
+            "change, or consistently wrote in a certain way, e.g. Hinglish). Otherwise "
+            "return {} for style. Do not repeat what is already known unless it changed.\n\n"
+            f"Already known style:\n{known}\n\nConversation:\n{convo}"
         )
         try:
             from core import gemini
-            summary = await asyncio.to_thread(
-                gemini.text, prompt, gemini.SMART, None, 30_000,
+            data = await asyncio.to_thread(
+                gemini.as_json, prompt, gemini.SMART, None, 30_000,
             )
-            if summary:
-                save_session_summary(summary, lang)
+            if isinstance(data, dict):
+                summary = str(data.get("summary") or "").strip()
+                if summary:
+                    save_session_summary(summary, lang)
+                style = data.get("style")
+                if isinstance(style, dict) and style:
+                    n = await asyncio.to_thread(merge_style, style)
+                    if n:
+                        print(f"[Memory] 🎭 Learned {n} style preference(s): {style}")
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
 
@@ -1935,6 +2208,11 @@ class JarvisLive:
                 if not speaking and not recent_speech:
                     try:
                         alerts = await asyncio.to_thread(monitor_check_all)
+                        try:
+                            from actions.world_monitor import check_world
+                            alerts += await asyncio.to_thread(check_world)
+                        except Exception as e:
+                            print(f"[WorldMonitor] ⚠️ {e}")
                         memory = load_memory()
                         lang_e = memory.get("identity", {}).get("language", {})
                         lang   = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
@@ -1942,7 +2220,8 @@ class JarvisLive:
                             msg = (
                                 f"{alert}\n\n"
                                 f"Inform the user about this development naturally in {lang}. "
-                                "One brief sentence only."
+                                + ("Mention the three headlines in one or two short sentences."
+                                   if "digest" in alert else "One brief sentence only.")
                             )
                             await self.session.send_client_content(
                                 turns={"role": "user", "parts": [{"text": msg}]},
@@ -2084,6 +2363,13 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            self._dashboard.set_control(
+                status=self._remote_status,
+                delegate=self._remote_delegate,
+                cancel=self._agent_hub.cancel,
+                stop_project=lambda name: self._action_registry.run(
+                    "dev_agent", {"action": "stop", "project_name": name}),
+            )
             asyncio.create_task(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())

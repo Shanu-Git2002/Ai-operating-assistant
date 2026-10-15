@@ -130,16 +130,22 @@ def _get_ddgs():
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     DDGS = _get_ddgs()
     results = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title":   r.get("title",  ""),
-                    "snippet": r.get("body",   ""),
-                    "url":     r.get("href",   ""),
-                })
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ DDG text() failed: {e}")
+    # DDG intermittently answers "No results found" for a valid query (rate
+    # limiting); one short retry recovers most of those.
+    for attempt in range(2):
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    results.append({
+                        "title":   r.get("title",  ""),
+                        "snippet": r.get("body",   ""),
+                        "url":     r.get("href",   ""),
+                    })
+        except Exception as e:
+            print(f"[WebSearch] ⚠️ DDG text() failed: {e}")
+        if results:
+            break
+        time.sleep(1.2)
     return results
 
 
@@ -297,8 +303,23 @@ def _research(query: str) -> str:
         return _gemini_search(research_query)
     except Exception as e:
         _log_gemini_failure("Gemini research", e)
-        results = _ddg_search(query, max_results=10)
-        return _format_ddg(query, results)
+        results = _ddg_search(query, max_results=8)
+        if not results:
+            return _format_ddg(query, results)
+        from core import gemini
+        # Grounded search is out of quota — synthesise the DDG results with the
+        # normal ladder instead (it starts on the Live model, a separate quota).
+        sources = "\n".join(f"[{i}] {r['title']} — {r['snippet']} ({r['url']})"
+                            for i, r in enumerate(results, 1))
+        answer = gemini.text(
+            f"Using ONLY these search results, answer: {query}\n"
+            "Be concrete (names, models, prices, numbers) and mention which source each "
+            f"fact comes from as [n]. If the results do not answer it, say so.\n\n{sources}",
+            tier=gemini.SMART, timeout_ms=45_000,
+        )
+        return (f"Research: {query}\n\n{answer}\n\nSources:\n"
+                + "\n".join(f"[{i}] {r['url']}" for i, r in enumerate(results, 1))
+                if answer else _format_ddg(query, results))
 
 
 def _price(query: str) -> str:

@@ -52,6 +52,7 @@ def _empty_memory() -> dict:
         "relationships": {},
         "wishes":        {},
         "notes":         {},
+        "style":         {},
     }
 
 def load_memory() -> dict:
@@ -186,6 +187,41 @@ _CATEGORY_LABELS = {
     "wishes":        "Wishes / plans",
     "notes":         "Notes",
 }
+
+# How the user wants to be answered. Shown in full on every session (it is a
+# handful of short lines) and phrased as instructions, unlike the other
+# categories, which are facts. Learned from explicit corrections (save_memory
+# with category "style") and from end-of-session observation.
+STYLE_MAX_ENTRIES = 10
+
+
+def format_style_for_prompt(memory: dict | None) -> str:
+    style = (memory or {}).get("style", {}) or {}
+    rows = sorted(((e.get("updated", "") if isinstance(e, dict) else "", k, _entry_value(e))
+                   for k, e in style.items() if _entry_value(e)), reverse=True)
+    if not rows:
+        return ""
+    lines = [f"  - {_pretty(k).title()}: {v}" for _u, k, v in rows[:STYLE_MAX_ENTRIES]]
+    return ("[HOW THIS PERSON WANTS YOU TO TALK — learned from them; follow these unless "
+            "the current request clearly asks otherwise. Their explicit corrections win "
+            "over your defaults]\n" + "\n".join(lines) + "\n")
+
+
+def merge_style(observations: dict) -> int:
+    """Merge style observations {key: value}; returns how many changed."""
+    clean = {}
+    for k, v in (observations or {}).items():
+        k = re.sub(r"[^a-z0-9_]+", "_", str(k).lower()).strip("_")[:40]
+        v = str(v or "").strip()
+        if k and v and v.lower() not in ("unknown", "none", "n/a", "null"):
+            clean[k] = {"value": v}
+    if not clean:
+        return 0
+    before = dict(load_memory().get("style", {}) or {})
+    update_memory({"style": clean})
+    after = load_memory().get("style", {}) or {}
+    return sum(1 for k in clean if before.get(k) != after.get(k))
+
 
 _IDENTITY_FIELDS = ["name", "age", "birthday", "city", "job",
                     "language", "school", "nationality"]
@@ -357,8 +393,8 @@ def search_memory(query: str, limit: int = 8) -> str:
 
     rows: list[tuple[int, str, str, str]] = []
     for cat, items in memory.items():
-        if not isinstance(items, dict):
-            continue                     # skip 'sessions', which is a list
+        if not isinstance(items, dict) or cat in _INTERNAL_KEYS:
+            continue                     # skip 'sessions' (a list) and monitor state
         for key, entry in items.items():
             val = _entry_value(entry)
             if not val:
@@ -371,13 +407,21 @@ def search_memory(query: str, limit: int = 8) -> str:
         return (f"Nothing stored about '{query}'." if query
                 else "I have not stored anything about this person yet.")
 
+    convo = search_conversations(query, limit=4) if words else ""
+
+    if not rows:
+        if convo:
+            return convo
+        return (f"Nothing stored about '{query}'." if query
+                else "I have not stored anything about this person yet.")
+
     rows.sort(key=lambda r: (-r[0], r[2]))
     lines = [f"{cat}/{_pretty(key)}: {val}" for _s, cat, key, val in rows[:max(1, limit)]]
     head  = (f"Stored facts matching '{query}':" if query
              else "Everything currently stored:")
     more  = (f"\n(+{len(rows) - len(lines)} more — search with a narrower keyword)"
              if len(rows) > len(lines) else "")
-    return head + "\n" + "\n".join(lines) + more
+    return head + "\n" + "\n".join(lines) + more + ("\n\n" + convo if convo else "")
 
 
 def all_entries_for_ui() -> list[dict]:
@@ -423,6 +467,70 @@ def forget(key: str, category: str = "notes") -> str:
 forget_memory = forget
 
 
+# ── Conversation history (permanent) ───────────────────────────────────────────
+#
+# 'sessions' in long_term.json is a tiny hand-off queue that the startup
+# briefing consumes. The permanent record of past conversations lives here, one
+# JSON line per session, so "what did we talk about last week?" has an answer.
+
+CONVO_PATH     = BASE_DIR / "memory" / "conversations.jsonl"
+_INTERNAL_KEYS = {"sessions", "monitors", "world_monitor"}
+
+
+def _read_conversations() -> list[dict]:
+    if not CONVO_PATH.exists():
+        # First run: seed the history with whatever the hand-off queue holds.
+        for e in load_memory().get("sessions", []) or []:
+            if isinstance(e, dict) and e.get("summary"):
+                append_conversation(e["summary"], e.get("language", ""))
+        if not CONVO_PATH.exists():
+            return []
+    out = []
+    for line in CONVO_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def append_conversation(summary: str, language: str = "") -> None:
+    entry = {"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "summary": summary.strip()}
+    if language:
+        entry["language"] = language
+    with _lock:
+        CONVO_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CONVO_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def recent_conversations_for_prompt(n: int = 3) -> str:
+    convos = _read_conversations()[-n:]
+    if not convos:
+        return ""
+    lines = [f"  - {c.get('date', '')[:10]}: {c.get('summary', '')}" for c in reversed(convos)]
+    return ("[RECENT CONVERSATIONS — context only; mention one only when it is relevant. "
+            "Older ones: recall_memory with a keyword]\n" + "\n".join(lines) + "\n")
+
+
+def search_conversations(query: str, limit: int = 4) -> str:
+    words = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 2]
+    convos = _read_conversations()
+    if not convos or not words:
+        return ""
+    scored = []
+    for i, c in enumerate(convos):
+        text = (c.get("summary") or "").lower()
+        s = sum(text.count(w) for w in words)
+        if s:
+            scored.append((s, i, c))
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    lines = [f"{c.get('date', '')}: {c.get('summary', '')}" for _s, _i, c in scored[:limit]]
+    return f"Past conversations mentioning '{query}':\n" + "\n".join(lines)
+
+
 # ── Session memory ─────────────────────────────────────────────────────────────
 
 _SESSION_MAX = 3   # safety cap — in practice 0-1 entries after pop
@@ -445,6 +553,10 @@ def save_session_summary(summary: str, language: str = "") -> None:
         entry["language"] = language
     sessions.append(entry)
     memory["sessions"] = sessions[-_SESSION_MAX:]
+    try:
+        append_conversation(summary, language)
+    except Exception as e:
+        print(f"[Memory] ⚠️ Could not append conversation history: {e}")
     with _lock:
         MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         MEMORY_PATH.write_text(

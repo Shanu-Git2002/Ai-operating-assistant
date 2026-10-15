@@ -11,6 +11,7 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import json
 import re
 import secrets
 import socket
@@ -465,6 +466,7 @@ class DashboardServer:
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
         self._connect_callback            = None
+        self._control                     = {}    # status/delegate/cancel/stop_project callables
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
@@ -518,6 +520,12 @@ class DashboardServer:
 
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
+
+    def set_control(self, **fns) -> None:
+        """Remote-control hooks from main.py: status() -> dict,
+        delegate(agent, task) -> str, cancel(job_id|None) -> str,
+        stop_project(name) -> str. All are called off the event loop."""
+        self._control.update(fns)
 
     # ── broadcast ────────────────────────────────────────────────────────
 
@@ -682,6 +690,50 @@ class DashboardServer:
                 if self._wake_callback:
                     self._wake_callback()
             return JSONResponse({"ok": True})
+
+        @app.get("/api/status")
+        async def status_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            fn = self._control.get("status")
+            if not fn:
+                return JSONResponse({"error": "Not available"}, status_code=503)
+            try:
+                return JSONResponse(await asyncio.to_thread(fn))
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/control")
+        async def control_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body   = await req.json()
+            token  = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            action = str(body.get("action", "")).strip()
+            if body.get("enc"):
+                plain = self._decrypt(token, body["enc"])
+                if plain is None:
+                    return JSONResponse({"error": "Decryption failed"}, status_code=400)
+                try:
+                    body.update(json.loads(plain))
+                except Exception:
+                    return JSONResponse({"error": "Bad payload"}, status_code=400)
+            try:
+                if action == "delegate" and self._control.get("delegate"):
+                    msg = await asyncio.to_thread(self._control["delegate"],
+                                                  str(body.get("agent", "")), str(body.get("task", "")))
+                elif action == "cancel" and self._control.get("cancel"):
+                    jid = body.get("job_id")
+                    msg = await asyncio.to_thread(self._control["cancel"],
+                                                  int(jid) if jid not in (None, "") else None)
+                elif action == "stop_project" and self._control.get("stop_project"):
+                    msg = await asyncio.to_thread(self._control["stop_project"],
+                                                  str(body.get("name", "")))
+                else:
+                    return JSONResponse({"error": f"Unknown action '{action}'"}, status_code=400)
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+            return JSONResponse({"ok": True, "message": msg})
 
         @app.post("/api/wake")
         async def wake_ep(req: Request):

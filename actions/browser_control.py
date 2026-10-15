@@ -5,15 +5,20 @@ import asyncio
 import concurrent.futures
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
+import time
+import urllib.request
 import webbrowser
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     async_playwright,
+    Browser,
     BrowserContext,
     Page,
     Playwright,
@@ -441,10 +446,95 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         return f"Could not open a browser for: {url}"
 
 
+# ── Single shared Chromium window (CDP) ──────────────────────────────────────
+# Chromium browsers are started ONCE as a normal process with a remote-debugging
+# port and JARVIS attaches to it over CDP. Every task (open, search, click,
+# close tab…) then works on tabs of that one window instead of spawning a new
+# Chrome per task. Chrome 136+ refuses remote debugging on the default profile,
+# so a dedicated persistent JARVIS profile is used — sign in there once and it
+# stays signed in.
+_CDP_PORTS: dict[str, int] = {
+    "chrome":  9222,
+    "edge":    9223,
+    "brave":   9224,
+    "vivaldi": 9225,
+    "opera":   9226,
+    "operagx": 9227,
+}
+
+_BLANK_PREFIXES = (
+    "about:blank", "chrome://newtab", "chrome://new-tab-page",
+    "chrome-search://", "edge://newtab", "brave://newtab",
+    "vivaldi://startpage", "opera://startpage",
+)
+
+
+def _is_blank(url: str | None) -> bool:
+    return not url or url.startswith(_BLANK_PREFIXES)
+
+
+def _host(url: str | None) -> str:
+    try:
+        host = urlparse(url or "").hostname or ""
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _jarvis_profile(browser_name: str) -> Path:
+    p = Path.home() / ".jarvis_profiles" / browser_name
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _cdp_alive(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/version", timeout=1
+        ) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _kill_profile_processes(profile: Path) -> bool:
+    """Kills browser processes using the JARVIS profile (stale/unreachable ones)."""
+    if _OS == "Windows":
+        return False
+    pattern = "--user-data-dir=" + re.escape(str(profile)) + "( |$)"
+    try:
+        r = subprocess.run(["pkill", "-TERM", "-f", pattern],
+                           capture_output=True, timeout=5)
+        if r.returncode == 0:
+            time.sleep(1.0)
+            return True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return False
+
+
+def _cdp_exe(browser_name: str) -> Optional[str]:
+    spec = _resolve_browser(browser_name)
+    if not spec or spec["engine"] != "chromium":
+        return None
+    exe = spec.get("exe")
+    if not exe and _OS == "Windows":
+        if browser_name in ("opera", "operagx"):
+            exe = _find_opera_windows()
+        else:
+            exe = _find_exe_windows(_WIN_EXE_HINTS.get(browser_name, browser_name))
+    return exe
+
+
+def _uses_cdp(browser_name: str) -> bool:
+    return browser_name in _CDP_PORTS and bool(_cdp_exe(browser_name))
+
+
 class _BrowserSession:
     """
     A full session for one browser instance.
-    All browsers open on the real profile via launch_persistent_context.
+    Chromium browsers: one shared window attached over CDP (see _CDP_PORTS).
+    Firefox / Safari: launch_persistent_context on the real profile.
     """
 
     def __init__(self, browser_name: str):
@@ -456,6 +546,7 @@ class _BrowserSession:
         self._ready    = threading.Event()
 
         self._pw:      Playwright     | None = None
+        self._browser: Browser        | None = None   # CDP-attached Chromium
         self._context: BrowserContext | None = None
         self._page:    Page           | None = None
 
@@ -486,22 +577,132 @@ class _BrowserSession:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
-    def close(self):
-        if self._loop:
-            asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(10)
+    def close(self) -> bool:
+        """Closes the browser window and stops this session. True if a window was closed."""
+        if not self._loop:
+            return False
+        try:
+            return asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(15)
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
 
-    async def _async_close(self):
-        if self._context:
+    async def _shutdown_browser(self) -> bool:
+        """Closes the whole browser window (all tabs). True if something was closed."""
+        closed = False
+        if self._browser is None and self.browser_name in _CDP_PORTS:
+            # Not attached yet (e.g. window left from a previous JARVIS run)
+            await self._attach_existing()
+        if self._browser is not None:
             try:
-                await self._context.close()
+                if self._browser.is_connected():
+                    cdp = await self._browser.new_browser_cdp_session()
+                    await cdp.send("Browser.close")
+                    closed = True
+            except Exception as e:
+                print(f"[Browser] CDP Browser.close failed: {e}")
+            try:
+                await self._browser.close()      # drop the CDP connection
             except Exception:
                 pass
+        elif self._context is not None:
+            try:
+                await self._context.close()
+                closed = True
+            except Exception:
+                pass
+        if self.browser_name in _CDP_PORTS:
+            port = _CDP_PORTS[self.browser_name]
+            for _ in range(20):
+                if not _cdp_alive(port):
+                    break
+                await asyncio.sleep(0.25)
+            else:
+                closed = await asyncio.to_thread(
+                    _kill_profile_processes, _jarvis_profile(self.browser_name)
+                ) or closed
+        self._reset()
+        return closed
+
+    async def _async_close(self) -> bool:
+        closed = await self._shutdown_browser()
         if self._pw:
             try:
                 await self._pw.stop()
             except Exception:
                 pass
-        self._context = self._page = None
+            self._pw = None
+        return closed
+
+    def _reset(self, *_):
+        self._browser = self._context = self._page = None
+
+    def _live_pages(self) -> list[Page]:
+        if self._context is None:
+            return []
+        return [p for p in self._context.pages if not p.is_closed()]
+
+    async def _attach_existing(self) -> bool:
+        """Attaches to an already running JARVIS window WITHOUT launching one."""
+        if self._context is not None:
+            return True
+        port = _CDP_PORTS.get(self.browser_name)
+        if port and _cdp_alive(port):
+            try:
+                await self._connect_cdp(port)
+                return True
+            except Exception as e:
+                print(f"[Browser] Could not attach to running {self.browser_name}: {e}")
+        return False
+
+    async def _connect_cdp(self, port: int):
+        self._browser = await self._pw.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}", timeout=15_000
+        )
+        self._browser.on("disconnected", self._reset)
+        self._context = (self._browser.contexts[0] if self._browser.contexts
+                         else await self._browser.new_context(no_viewport=True))
+        pages = self._live_pages()
+        self._page = pages[-1] if pages else await self._context.new_page()
+
+    async def _launch_cdp(self) -> bool:
+        """Starts (or re-uses) the single shared window. False if not possible."""
+        port = _CDP_PORTS.get(self.browser_name)
+        exe  = _cdp_exe(self.browser_name)
+        if not port or not exe:
+            return False
+
+        if not _cdp_alive(port):
+            profile = _jarvis_profile(self.browser_name)
+            # A browser holding the JARVIS profile without the debug port (e.g.
+            # an old automation window) would swallow our launch — close it.
+            await asyncio.to_thread(_kill_profile_processes, profile)
+            args = [
+                exe,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--start-maximized",
+            ]
+            popen_kw: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if _OS == "Windows":
+                popen_kw["creationflags"] = (subprocess.DETACHED_PROCESS
+                                             | subprocess.CREATE_NEW_PROCESS_GROUP)
+            else:
+                popen_kw["start_new_session"] = True
+            subprocess.Popen(args, **popen_kw)
+            for _ in range(80):                      # up to ~20 s
+                if _cdp_alive(port):
+                    break
+                await asyncio.sleep(0.25)
+            else:
+                print(f"[Browser] ⚠️  {self.browser_name} debug port {port} never came up")
+                return False
+
+        await self._connect_cdp(port)
+        print(f"[Browser] ✅ Attached to {self.browser_name} window (port {port})")
+        return True
 
     async def _adopt_page(self) -> Page:
         """
@@ -520,6 +721,15 @@ class _BrowserSession:
         """
         if self._context is not None:
             return
+
+        if self.browser_name in _CDP_PORTS:
+            try:
+                if await self._launch_cdp():
+                    return
+            except Exception as e:
+                print(f"[Browser] ⚠️  Shared-window launch failed for {self.browser_name}: {e}")
+                self._reset()
+            print(f"[Browser] Falling back to a Playwright-launched window")
 
         if self._spec is None:
             raise RuntimeError(
@@ -626,16 +836,31 @@ class _BrowserSession:
 
     async def _get_page(self) -> Page:
         await self._launch()
-        # If somehow page got closed, open a fresh one
+        # Active tab was closed (by the user or close_tab) → use another open
+        # tab of the same window; only open a new one if none is left.
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            pages = self._live_pages()
+            self._page = pages[-1] if pages else await self._context.new_page()
             await asyncio.sleep(0.2)
         return self._page
 
-    async def go_to(self, url: str) -> str:
-
-        url      = _normalize_url(url)
-        page     = await self._get_page()
+    async def go_to(self, url: str, new_tab: bool | None = None) -> str:
+        """
+        Navigates inside the shared window. A blank tab or a tab already on the
+        same site is reused; a different site opens as a NEW TAB in the same
+        window (never a new browser window).
+        """
+        url  = _normalize_url(url)
+        page = await self._get_page()
+        if new_tab is None:
+            new_tab = not _is_blank(page.url) and _host(page.url) != _host(url)
+        if new_tab:
+            page       = await self._context.new_page()
+            self._page = page
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
         prev_url = page.url
 
         async def _do_goto(p: Page) -> str:
@@ -651,16 +876,11 @@ class _BrowserSession:
 
         result_url = await _do_goto(page)
 
-        if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
-            print(f"[Browser] Still blank after goto — retrying on new tab: {url}")
-            try:
-                new_page   = await self._context.new_page()
-                self._page = new_page
-                result_url = await _do_goto(new_page)
-            except Exception as e:
-                print(f"[Browser] New-tab retry failed: {e}")
+        if _is_blank(result_url) and _is_blank(prev_url):
+            print(f"[Browser] Still blank after goto — retrying: {url}")
+            result_url = await _do_goto(page)
 
-        if result_url and result_url not in ("about:blank", "", None):
+        if not _is_blank(result_url):
             return f"Opened: {result_url}"
         return f"Could not open: {url}"
 
@@ -784,23 +1004,107 @@ class _BrowserSession:
         return f"Could not find input: '{description}'"
 
     async def new_tab(self, url: str = "") -> str:
-        page = await self._get_page()
-        ctx  = page.context
-        new  = await ctx.new_page()
-        self._page = new
         if url:
-            return await self.go_to(url)
+            return await self.go_to(url, new_tab=True)
+        await self._get_page()
+        self._page = await self._context.new_page()
+        try:
+            await self._page.bring_to_front()
+        except Exception:
+            pass
         return "New tab opened."
 
-    async def close_tab(self) -> str:
-        page = self._page
-        if page and not page.is_closed():
-            ctx   = page.context
-            await page.close()
-            pages = ctx.pages
-            self._page = pages[-1] if pages else None
-            return "Tab closed."
-        return "No active tab to close."
+    async def _find_tabs(self, match: str) -> list[Page]:
+        """Tabs whose title or URL contains `match` (case-insensitive)."""
+        match = match.lower().strip()
+        found = []
+        for p in self._live_pages():
+            try:
+                title = (await p.title()).lower()
+            except Exception:
+                title = ""
+            if match in title or match in p.url.lower():
+                found.append(p)
+        return found
+
+    async def list_tabs(self) -> str:
+        if not await self._attach_existing():
+            return f"No {self.browser_name} window is open."
+        lines = []
+        for i, p in enumerate(self._live_pages(), 1):
+            try:
+                title = await p.title()
+            except Exception:
+                title = ""
+            marker = " ◀ active" if p is self._page else ""
+            lines.append(f"  {i}. {title or '(untitled)'} — {p.url}{marker}")
+        return "Open tabs:\n" + "\n".join(lines) if lines else "No open tabs."
+
+    async def switch_tab(self, match: str) -> str:
+        if not await self._attach_existing():
+            return f"No {self.browser_name} window is open."
+        pages = self._live_pages()
+        target = None
+        if match.strip().isdigit() and 1 <= int(match) <= len(pages):
+            target = pages[int(match) - 1]
+        elif match.strip():
+            found  = await self._find_tabs(match)
+            target = found[0] if found else None
+        if target is None:
+            return f"No tab matching '{match}'."
+        self._page = target
+        await target.bring_to_front()
+        return f"Switched to tab: {await target.title() or target.url}"
+
+    async def close_tab(self, match: str = "") -> str:
+        """
+        Closes ONE tab: the tab matching `match` (title/URL fragment or 1-based
+        index), otherwise the active tab. Never launches a browser.
+        """
+        if not await self._attach_existing():
+            return f"No {self.browser_name} window is open."
+        pages = self._live_pages()
+        if not pages:
+            return "No open tab to close."
+
+        match = (match or "").strip()
+        if match.isdigit() and 1 <= int(match) <= len(pages):
+            targets = [pages[int(match) - 1]]
+        elif match:
+            targets = await self._find_tabs(match)
+            if not targets:
+                return f"No tab matching '{match}'."
+        else:
+            active  = self._page if self._page and not self._page.is_closed() else pages[-1]
+            targets = [active]
+
+        names = []
+        for p in targets:
+            try:
+                names.append(await p.title() or p.url)
+            except Exception:
+                names.append(p.url)
+
+        if len(targets) == len(pages):
+            # Closing every tab == closing the window; do it cleanly.
+            await self._shutdown_browser()
+            return f"Closed last tab ({', '.join(names)}); {self.browser_name} closed."
+
+        for p in targets:
+            try:
+                await p.close()
+            except Exception as e:
+                print(f"[Browser] Tab close failed: {e}")
+
+        remaining = self._live_pages()
+        if self._page is None or self._page.is_closed():
+            self._page = remaining[-1] if remaining else None
+        if self._page:
+            try:
+                await self._page.bring_to_front()
+            except Exception:
+                pass
+        return "Closed tab: " + ", ".join(names)
 
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
@@ -836,8 +1140,8 @@ class _BrowserSession:
             return f"Reload error: {e}"
 
     async def close_browser(self) -> str:
-        await self._async_close()
-        return f"{self.browser_name} closed."
+        closed = await self._shutdown_browser()
+        return f"{self.browser_name} closed." if closed else f"No {self.browser_name} window is open."
 
 class _SessionRegistry:
     """Manages all active browser sessions."""
@@ -888,13 +1192,64 @@ class _SessionRegistry:
         return f"Active browser → {browser_name}"
 
     def close_one(self, browser_name: str) -> str:
+        browser_name = _ALIASES.get(
+            browser_name.lower().strip(),
+            browser_name.lower().strip()
+        )
+
+        # First close the JARVIS-managed window (also one left over from a
+        # previous JARVIS run that is still listening on its debug port).
         with self._lock:
             sess = self._sessions.pop(browser_name, None)
+        if sess is None and browser_name in _CDP_PORTS \
+                and _cdp_alive(_CDP_PORTS[browser_name]):
+            sess = _BrowserSession(browser_name)
+            sess.start()
+
         if sess:
-            sess.close()
-            if self._active_browser == browser_name:
-                self._active_browser = ""
-            return f"{browser_name} closed."
+            try:
+                closed = sess.close()
+            except Exception as e:
+                print(f"[Registry] Closing {browser_name} failed: {e}")
+                closed = False
+            finally:
+                if self._active_browser == browser_name:
+                    self._active_browser = ""
+            if closed:
+                return f"{browser_name} closed."
+
+        # Native browser fallback.
+        # Required for browsers opened through webbrowser.open()
+        # or native OS launching, especially on Wayland.
+        native_processes = {
+            "chrome": ["chrome"],
+            "firefox": ["firefox"],
+            "brave": ["brave"],
+            "edge": ["msedge"],
+            "opera": ["opera"],
+            "vivaldi": ["vivaldi"],
+        }
+
+        processes = native_processes.get(browser_name, [])
+
+        if _OS == "Linux" and processes:
+            for process_name in processes:
+                try:
+                    result = subprocess.run(
+                        ["pkill", "-TERM", "-x", process_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+
+                    if result.returncode == 0:
+                        if self._active_browser == browser_name:
+                            self._active_browser = ""
+                        return f"{browser_name} closed."
+
+                except (subprocess.TimeoutExpired, OSError):
+                    continue
+
         return f"No active session for: {browser_name}"
 
     def close_all(self) -> str:
@@ -903,6 +1258,13 @@ class _SessionRegistry:
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._active_browser = ""
+        # JARVIS windows still running without a session (previous run)
+        for name, port in _CDP_PORTS.items():
+            if name not in names and _cdp_alive(port):
+                s = _BrowserSession(name)
+                s.start()
+                names.append(name)
+                sessions.append(s)
         for s in sessions:
             try:
                 s.close()
@@ -950,21 +1312,42 @@ def browser_control(
         _log(player, result)
         return result
 
-    if action == "close":
-        target = browser or _registry._active_browser
-        result = _registry.close_one(target) if target else "No browser specified."
+    if action in ("close", "close_browser"):
+        target = browser or _registry._active_browser or _detect_default_browser()
+        result = _registry.close_one(target)
         _log(player, result)
         return result
 
-    # ── Navigation is ALWAYS native ──────────────────────────────────────────
-    # go_to / search / new_tab open the site in the user's own browser —
-    # their own profile, logged-in accounts and start page; exactly as if the
-    # user had opened it themselves. A controlled window with about:blank never
-    # opens here. The only exception: if an automation flow is already running,
-    # navigation continues in that window (so multi-step tasks aren't split).
-    if action in ("go_to", "search", "new_tab"):
-        if _registry.has(browser):
+    # ── Tab management — never launches a browser ────────────────────────────
+    if action in ("close_tab", "list_tabs", "switch_tab"):
+        match = str(params.get("tab") or params.get("text") or params.get("url")
+                    or params.get("description") or "")
+        try:
             sess = _registry.get(browser)
+            if action == "close_tab":
+                result = sess.run(sess.close_tab(match))
+            elif action == "list_tabs":
+                result = sess.run(sess.list_tabs())
+            else:
+                result = sess.run(sess.switch_tab(match))
+        except concurrent.futures.TimeoutError:
+            result = f"Browser action '{action}' timed out (60s)."
+        except Exception as e:
+            result = f"Browser error ({action}): {e}"
+        _log(player, result)
+        return result
+
+    # ── Navigation ───────────────────────────────────────────────────────────
+    # Chromium browsers (Chrome, Edge, Brave…): everything happens in ONE shared
+    # JARVIS window — a new site opens as a new tab there, so later click /
+    # type / close_tab work on the same window. Firefox / Safari open natively
+    # (user's own profile) unless an automation flow is already running.
+    # If the shared window can't be started we fall back to a native open.
+    if action in ("go_to", "search", "new_tab"):
+        nav_name = browser or _registry._active_browser or _detect_default_browser()
+        nav_name = _ALIASES.get(nav_name.lower().strip(), nav_name.lower().strip())
+        if _uses_cdp(nav_name) or _registry.has(nav_name):
+            sess = _registry.get(nav_name)
             try:
                 if action == "search":
                     result = sess.run(sess.search(params.get("query", ""),
@@ -977,8 +1360,10 @@ def browser_control(
                 result = f"Browser action '{action}' timed out (60s)."
             except Exception as e:
                 result = f"Browser error ({action}): {e}"
-            _log(player, result)
-            return result
+            if not result.startswith("Browser error"):
+                _log(player, result)
+                return result
+            print(f"[Browser] {result} — falling back to native open")
 
         if action == "search":
             base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
@@ -1031,8 +1416,6 @@ def browser_control(
             result = sess.run(sess.get_url())
         elif action == "press":
             result = sess.run(sess.press(params.get("key", "Enter")))
-        elif action == "close_tab":
-            result = sess.run(sess.close_tab())
         elif action == "screenshot":
             result = sess.run(sess.screenshot(params.get("path")))
         elif action == "back":
@@ -1063,17 +1446,21 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Chrome/Edge/Brave/Vivaldi/Opera use ONE shared JARVIS window: go_to/search open a new site as a new TAB in that same window (never a new window), and click/type/close_tab work on it. To close one tab use close_tab (optionally pass 'tab' = part of the tab title/URL or its number from list_tabs); to close the whole browser use close; close_all closes every browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | list_tabs | switch_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",
                 "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
+            },
+            "tab": {
+                "type": "STRING",
+                "description": "For close_tab / switch_tab: part of the tab's title or URL (e.g. 'youtube'), or its number from list_tabs. Omit to use the current tab."
             },
             "url": {
                 "type": "STRING",

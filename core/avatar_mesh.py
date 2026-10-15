@@ -244,6 +244,35 @@ def _unique_edges(faces: np.ndarray) -> np.ndarray:
     e = np.sort(e, axis=1)
     return np.unique(e, axis=0)
 
+def _apply_feminine_morphology(verts: np.ndarray, n_head: int) -> np.ndarray:
+    """
+    Subtle feminine facial proportions while preserving the original
+    MediaPipe topology and landmark indices.
+    """
+    v = verts.copy()
+    y = v[:, 1]
+    x = v[:, 0]
+    z = v[:, 2]
+    y_min = y[:n_head].min()
+    y_max = y[:n_head].max()
+    h = max(y_max - y_min, 1e-6)
+    t = np.clip((y - y_min) / h, 0.0, 1.0)
+    lower_face = np.clip((0.62 - t) / 0.62, 0.0, 1.0)
+    jaw_scale = 1.0 - 0.10 * lower_face
+    v[:, 0] *= jaw_scale
+    cheek = np.exp(-((t - 0.48) / 0.22) ** 2)
+    cheek *= np.exp(-(x / 0.70) ** 2)
+    v[:, 0] *= 1.0 + 0.035 * cheek
+    chin = np.exp(-((t - 0.15) / 0.18) ** 2)
+    v[:, 0] *= 1.0 - 0.07 * chin
+    nose = np.exp(-((x / 0.24) ** 2))
+    nose *= np.exp(-((t - 0.48) / 0.25) ** 2)
+    v[:, 2] -= 0.035 * nose
+    forehead = np.exp(-((t - 0.78) / 0.18) ** 2)
+    v[:, 0] *= 1.0 + 0.025 * forehead
+    v[n_head:] = verts[n_head:]
+
+    return v
 
 def _check_landmarks(verts: np.ndarray) -> None:
     """Fail loudly at build time if a landmark ring is not where it should be."""
@@ -276,7 +305,7 @@ def build_head() -> dict:
     scale = 2.0 / (crown - chin)
     centre = np.array([0.0, (crown + chin) * 0.5, 0.0])
     verts = (verts - centre) * scale
-
+    verts = _apply_feminine_morphology(verts, n_head)
     # Outward reference, per part: the head is star-shaped about its own centre,
     # while the neck is a tube whose outward direction is radial in x/z only.
     outward = verts - np.array([0.0, verts[:n_head, 1].mean(), 0.0])
